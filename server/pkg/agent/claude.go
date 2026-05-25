@@ -109,7 +109,8 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		_ = cmd.Wait()
 		return nil, errors.New(withAgentStderr(fmt.Sprintf("write claude input: %v", err), "claude", stderrBuf.Tail()))
 	}
-	closeStdin()
+	// Keep stdin open — we need it to respond to control_request messages
+	// from Claude Code when running in "plan" permission mode.
 
 	b.cfg.Logger.Info("claude started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
 
@@ -178,6 +179,8 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					finalStatus = "failed"
 					finalError = msg.ResultText
 				}
+			case "control_request":
+				b.handleControlRequest(msg, stdin)
 			case "log":
 				if msg.Log != nil {
 					trySend(msgCh, Message{
@@ -300,7 +303,6 @@ func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) {
 }
 
 func (b *claudeBackend) handleControlRequest(msg claudeSDKMessage, stdin interface{ Write([]byte) (int, error) }) {
-	// Auto-approve all tool uses in autonomous/daemon mode.
 	var req claudeControlRequestPayload
 	if err := json.Unmarshal(msg.Request, &req); err != nil {
 		return
@@ -314,13 +316,23 @@ func (b *claudeBackend) handleControlRequest(msg claudeSDKMessage, stdin interfa
 		inputMap = map[string]any{}
 	}
 
+	behavior := "allow"
+	if reason := checkDangerousTool(req.ToolName, inputMap); reason != "" {
+		behavior = "deny"
+		b.cfg.Logger.Warn("claude: denied dangerous tool use",
+			"tool", req.ToolName,
+			"reason", reason,
+			"request_id", msg.RequestID,
+		)
+	}
+
 	response := map[string]any{
 		"type": "control_response",
 		"response": map[string]any{
 			"subtype":    "success",
 			"request_id": msg.RequestID,
 			"response": map[string]any{
-				"behavior":     "allow",
+				"behavior":     behavior,
 				"updatedInput": inputMap,
 			},
 		},
@@ -335,6 +347,78 @@ func (b *claudeBackend) handleControlRequest(msg claudeSDKMessage, stdin interfa
 	if _, err := stdin.Write(data); err != nil {
 		b.cfg.Logger.Warn("claude: failed to write control response", "error", err)
 	}
+}
+
+// checkDangerousTool inspects a tool invocation and returns a non-empty reason
+// string if the operation should be denied. An empty string means "allow".
+func checkDangerousTool(toolName string, input map[string]any) string {
+	if toolName != "Bash" {
+		return ""
+	}
+	cmd, _ := input["command"].(string)
+	if cmd == "" {
+		return ""
+	}
+	lower := strings.ToLower(cmd)
+
+	// Deny execution of binaries from world-writable directories.
+	for _, dir := range []string{"/dev/shm", "/tmp/", "/var/tmp/"} {
+		if strings.Contains(lower, dir) && containsExecPattern(lower, dir) {
+			return "execution from " + dir + " is blocked"
+		}
+	}
+
+	// Deny common crypto-miner and reverse-shell patterns.
+	dangerousPatterns := []string{
+		"xmrig",
+		"minerd",
+		"cpuminer",
+		"cryptonight",
+		"stratum+tcp",
+		"stratum+ssl",
+		"randomx",
+		"bash -i >& /dev/tcp",
+		"nc -e /bin",
+		"ncat -e /bin",
+		"mkfifo /tmp/",
+	}
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(lower, pattern) {
+			return "blocked pattern: " + pattern
+		}
+	}
+
+	return ""
+}
+
+// containsExecPattern checks whether a command tries to execute something from
+// or write an executable into a given directory.
+func containsExecPattern(cmd, dir string) bool {
+	execIndicators := []string{
+		"chmod +x",
+		"chmod 755",
+		"chmod 777",
+		"chmod a+x",
+		"./" + dir,
+	}
+	for _, ind := range execIndicators {
+		if strings.Contains(cmd, ind) {
+			return true
+		}
+	}
+	// Direct execution: the directory path appears at the start of a word
+	// that isn't part of a read-only command (cat, ls, rm, etc.)
+	readOnlyPrefixes := []string{"cat ", "ls ", "rm ", "head ", "tail ", "file ", "stat ", "wc "}
+	for _, prefix := range readOnlyPrefixes {
+		if strings.Contains(cmd, prefix+dir) {
+			return false
+		}
+	}
+	// Check for wget/curl downloading into the directory.
+	if (strings.Contains(cmd, "curl") || strings.Contains(cmd, "wget")) && strings.Contains(cmd, dir) {
+		return true
+	}
+	return false
 }
 
 // ── Claude SDK JSON types ──
@@ -467,7 +551,7 @@ var claudeBlockedArgs = map[string]blockedArgMode{
 	"-p":                blockedStandalone, // non-interactive mode
 	"--output-format":   blockedWithValue,  // stream-json protocol
 	"--input-format":    blockedWithValue,  // stream-json protocol
-	"--permission-mode": blockedWithValue,  // bypassPermissions for autonomous operation
+	"--permission-mode": blockedWithValue,  // plan mode with security filtering
 	"--mcp-config":      blockedWithValue,  // set by daemon from agent.mcp_config
 	// `--effort` is owned by the per-agent thinking_level picker so a
 	// user-supplied custom_arg cannot silently outvote it. The daemon
@@ -485,7 +569,7 @@ func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 		"--input-format", "stream-json",
 		"--verbose",
 		"--strict-mcp-config",
-		"--permission-mode", "bypassPermissions",
+		"--permission-mode", "plan",
 		// AskUserQuestion is Claude Code's built-in interactive question tool.
 		// The daemon runs Claude in non-interactive stream-json mode and has
 		// no UI for the prompt to render in, so a call returns an empty
