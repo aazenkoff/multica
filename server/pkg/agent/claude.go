@@ -109,8 +109,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		_ = cmd.Wait()
 		return nil, errors.New(withAgentStderr(fmt.Sprintf("write claude input: %v", err), "claude", stderrBuf.Tail()))
 	}
-	// Keep stdin open — we need it to respond to control_request messages
-	// from Claude Code when running in "plan" permission mode.
+	closeStdin()
 
 	b.cfg.Logger.Info("claude started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
 
@@ -157,7 +156,12 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 			switch msg.Type {
 			case "assistant":
-				b.handleAssistant(msg, msgCh, &output, usage)
+				if reason := b.handleAssistant(msg, msgCh, &output, usage); reason != "" {
+					finalStatus = "failed"
+					finalError = fmt.Sprintf("agent killed: dangerous tool use denied (%s)", reason)
+					logSecurityEvent(b.cfg.Logger, cmd.Process.Pid, opts.Cwd, reason)
+					cancel()
+				}
 			case "user":
 				b.handleUser(msg, msgCh)
 			case "system":
@@ -179,8 +183,6 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					finalStatus = "failed"
 					finalError = msg.ResultText
 				}
-			case "control_request":
-				b.handleControlRequest(msg, stdin)
 			case "log":
 				if msg.Log != nil {
 					trySend(msgCh, Message{
@@ -239,10 +241,13 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
-func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, output *strings.Builder, usage map[string]TokenUsage) {
+// handleAssistant processes an assistant message. It returns a non-empty
+// string if a dangerous tool invocation was detected — the caller should
+// kill the agent process immediately.
+func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, output *strings.Builder, usage map[string]TokenUsage) string {
 	var content claudeMessageContent
 	if err := json.Unmarshal(msg.Message, &content); err != nil {
-		return
+		return ""
 	}
 
 	// Accumulate token usage per model.
@@ -271,6 +276,9 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 			if block.Input != nil {
 				_ = json.Unmarshal(block.Input, &input)
 			}
+			if reason := checkDangerousTool(block.Name, input); reason != "" {
+				return reason
+			}
 			trySend(ch, Message{
 				Type:   MessageToolUse,
 				Tool:   block.Name,
@@ -279,6 +287,7 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 			})
 		}
 	}
+	return ""
 }
 
 func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) {
@@ -421,6 +430,25 @@ func containsExecPattern(cmd, dir string) bool {
 	return false
 }
 
+const securityLogPath = "/var/log/multica-security.log"
+
+// logSecurityEvent appends a structured line to the dedicated security log
+// file so operators can audit denied tool invocations independently from
+// the main daemon log.
+func logSecurityEvent(logger *slog.Logger, pid int, cwd, reason string) {
+	entry := fmt.Sprintf("%s  DENIED  pid=%d  cwd=%s  reason=%q\n",
+		time.Now().UTC().Format(time.RFC3339), pid, cwd, reason)
+
+	f, err := os.OpenFile(securityLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		logger.Warn("claude: failed to write security log", "error", err)
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(entry)
+	logger.Warn("claude: agent killed for dangerous tool use", "pid", pid, "reason", reason)
+}
+
 // ── Claude SDK JSON types ──
 
 type claudeSDKMessage struct {
@@ -551,7 +579,7 @@ var claudeBlockedArgs = map[string]blockedArgMode{
 	"-p":                blockedStandalone, // non-interactive mode
 	"--output-format":   blockedWithValue,  // stream-json protocol
 	"--input-format":    blockedWithValue,  // stream-json protocol
-	"--permission-mode": blockedWithValue,  // plan mode with security filtering
+	"--permission-mode": blockedWithValue,  // bypassPermissions with tool-use watchdog
 	"--mcp-config":      blockedWithValue,  // set by daemon from agent.mcp_config
 	// `--effort` is owned by the per-agent thinking_level picker so a
 	// user-supplied custom_arg cannot silently outvote it. The daemon
@@ -569,7 +597,7 @@ func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 		"--input-format", "stream-json",
 		"--verbose",
 		"--strict-mcp-config",
-		"--permission-mode", "plan",
+		"--permission-mode", "bypassPermissions",
 		// AskUserQuestion is Claude Code's built-in interactive question tool.
 		// The daemon runs Claude in non-interactive stream-json mode and has
 		// no UI for the prompt to render in, so a call returns an empty

@@ -30,7 +30,7 @@ func TestClaudeHandleAssistantText(t *testing.T) {
 		}),
 	}
 
-	b.handleAssistant(msg, ch, &output, make(map[string]TokenUsage))
+	_ = b.handleAssistant(msg, ch, &output, make(map[string]TokenUsage))
 
 	if output.String() != "Hello world" {
 		t.Fatalf("expected output 'Hello world', got %q", output.String())
@@ -67,7 +67,7 @@ func TestClaudeHandleAssistantToolUse(t *testing.T) {
 		}),
 	}
 
-	b.handleAssistant(msg, ch, &output, make(map[string]TokenUsage))
+	_ = b.handleAssistant(msg, ch, &output, make(map[string]TokenUsage))
 
 	if output.String() != "" {
 		t.Fatalf("tool_use should not add to output, got %q", output.String())
@@ -285,6 +285,77 @@ func TestCheckDangerousTool(t *testing.T) {
 	}
 }
 
+func TestClaudeHandleAssistantKillsDangerousToolUse(t *testing.T) {
+	t.Parallel()
+
+	b := &claudeBackend{cfg: Config{Logger: slog.Default()}}
+	ch := make(chan Message, 10)
+	var output strings.Builder
+
+	msg := claudeSDKMessage{
+		Type: "assistant",
+		Message: mustMarshal(t, claudeMessageContent{
+			Role: "assistant",
+			Content: []claudeContentBlock{
+				{
+					Type:  "tool_use",
+					ID:    "call-evil",
+					Name:  "Bash",
+					Input: mustMarshal(t, map[string]any{"command": "chmod +x /dev/shm/miner && /dev/shm/miner"}),
+				},
+			},
+		}),
+	}
+
+	reason := b.handleAssistant(msg, ch, &output, make(map[string]TokenUsage))
+	if reason == "" {
+		t.Fatal("expected non-empty deny reason for dangerous tool use")
+	}
+
+	select {
+	case m := <-ch:
+		t.Fatalf("expected no message for denied tool use, got %+v", m)
+	default:
+	}
+}
+
+func TestClaudeHandleAssistantAllowsSafeToolUse(t *testing.T) {
+	t.Parallel()
+
+	b := &claudeBackend{cfg: Config{Logger: slog.Default()}}
+	ch := make(chan Message, 10)
+	var output strings.Builder
+
+	msg := claudeSDKMessage{
+		Type: "assistant",
+		Message: mustMarshal(t, claudeMessageContent{
+			Role: "assistant",
+			Content: []claudeContentBlock{
+				{
+					Type:  "tool_use",
+					ID:    "call-safe",
+					Name:  "Bash",
+					Input: mustMarshal(t, map[string]any{"command": "git status"}),
+				},
+			},
+		}),
+	}
+
+	reason := b.handleAssistant(msg, ch, &output, make(map[string]TokenUsage))
+	if reason != "" {
+		t.Fatalf("expected allow, got deny: %s", reason)
+	}
+
+	select {
+	case m := <-ch:
+		if m.Type != MessageToolUse || m.Tool != "Bash" {
+			t.Fatalf("unexpected message: %+v", m)
+		}
+	default:
+		t.Fatal("expected tool_use message on channel")
+	}
+}
+
 func TestClaudeHandleAssistantInvalidJSON(t *testing.T) {
 	t.Parallel()
 
@@ -298,7 +369,7 @@ func TestClaudeHandleAssistantInvalidJSON(t *testing.T) {
 	}
 
 	// Should not panic
-	b.handleAssistant(msg, ch, &output, make(map[string]TokenUsage))
+	_ = b.handleAssistant(msg, ch, &output, make(map[string]TokenUsage))
 
 	if output.String() != "" {
 		t.Fatalf("expected empty output for invalid JSON, got %q", output.String())
@@ -340,7 +411,7 @@ func TestBuildClaudeArgsIncludesStrictMCPConfig(t *testing.T) {
 		"--input-format", "stream-json",
 		"--verbose",
 		"--strict-mcp-config",
-		"--permission-mode", "plan",
+		"--permission-mode", "bypassPermissions",
 		"--disallowedTools", "AskUserQuestion",
 	}
 
@@ -682,7 +753,7 @@ func TestClaudeExecuteSurfacesStderrWhenChildExitsEarly(t *testing.T) {
 	// Result.Error would be a useless "exit status 3".
 	fakePath := filepath.Join(t.TempDir(), "claude")
 	script := "#!/bin/sh\n" +
-		"read _line\n" +
+		"cat >/dev/null\n" +
 		"echo \"FATAL ERROR: V8 abort: assertion failed\" >&2\n" +
 		"exit 3\n"
 	writeTestExecutable(t, fakePath, []byte(script))
@@ -734,7 +805,7 @@ func TestClaudeExecuteRecordsResultModelUsage(t *testing.T) {
 
 	fakePath := filepath.Join(t.TempDir(), "claude")
 	script := "#!/bin/sh\n" +
-		"read _line\n" +
+		"cat >/dev/null\n" +
 		"printf '%s\\n' '{\"type\":\"system\",\"session_id\":\"sess-result-usage\"}'\n" +
 		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"sess-result-usage\",\"result\":\"done\",\"modelUsage\":{\"zhipu/coding-plan\":{\"inputTokens\":123,\"outputTokens\":45,\"cacheReadInputTokens\":7,\"cacheCreationInputTokens\":11,\"costUSD\":0.01}}}'\n"
 	writeTestExecutable(t, fakePath, []byte(script))
