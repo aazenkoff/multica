@@ -156,7 +156,12 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 			switch msg.Type {
 			case "assistant":
-				b.handleAssistant(msg, msgCh, &output, usage)
+				if reason := b.handleAssistant(msg, msgCh, &output, usage); reason != "" {
+					finalStatus = "failed"
+					finalError = fmt.Sprintf("agent killed: dangerous tool use denied (%s)", reason)
+					logSecurityEvent(b.cfg.Logger, cmd.Process.Pid, opts.Cwd, reason)
+					cancel()
+				}
 			case "user":
 				b.handleUser(msg, msgCh)
 			case "system":
@@ -236,10 +241,13 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
-func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, output *strings.Builder, usage map[string]TokenUsage) {
+// handleAssistant processes an assistant message. It returns a non-empty
+// string if a dangerous tool invocation was detected — the caller should
+// kill the agent process immediately.
+func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, output *strings.Builder, usage map[string]TokenUsage) string {
 	var content claudeMessageContent
 	if err := json.Unmarshal(msg.Message, &content); err != nil {
-		return
+		return ""
 	}
 
 	// Accumulate token usage per model.
@@ -268,6 +276,9 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 			if block.Input != nil {
 				_ = json.Unmarshal(block.Input, &input)
 			}
+			if reason := checkDangerousTool(block.Name, input); reason != "" {
+				return reason
+			}
 			trySend(ch, Message{
 				Type:   MessageToolUse,
 				Tool:   block.Name,
@@ -276,6 +287,7 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 			})
 		}
 	}
+	return ""
 }
 
 func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) {
@@ -300,7 +312,6 @@ func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) {
 }
 
 func (b *claudeBackend) handleControlRequest(msg claudeSDKMessage, stdin interface{ Write([]byte) (int, error) }) {
-	// Auto-approve all tool uses in autonomous/daemon mode.
 	var req claudeControlRequestPayload
 	if err := json.Unmarshal(msg.Request, &req); err != nil {
 		return
@@ -314,13 +325,23 @@ func (b *claudeBackend) handleControlRequest(msg claudeSDKMessage, stdin interfa
 		inputMap = map[string]any{}
 	}
 
+	behavior := "allow"
+	if reason := checkDangerousTool(req.ToolName, inputMap); reason != "" {
+		behavior = "deny"
+		b.cfg.Logger.Warn("claude: denied dangerous tool use",
+			"tool", req.ToolName,
+			"reason", reason,
+			"request_id", msg.RequestID,
+		)
+	}
+
 	response := map[string]any{
 		"type": "control_response",
 		"response": map[string]any{
 			"subtype":    "success",
 			"request_id": msg.RequestID,
 			"response": map[string]any{
-				"behavior":     "allow",
+				"behavior":     behavior,
 				"updatedInput": inputMap,
 			},
 		},
@@ -335,6 +356,97 @@ func (b *claudeBackend) handleControlRequest(msg claudeSDKMessage, stdin interfa
 	if _, err := stdin.Write(data); err != nil {
 		b.cfg.Logger.Warn("claude: failed to write control response", "error", err)
 	}
+}
+
+// checkDangerousTool inspects a tool invocation and returns a non-empty reason
+// string if the operation should be denied. An empty string means "allow".
+func checkDangerousTool(toolName string, input map[string]any) string {
+	if toolName != "Bash" {
+		return ""
+	}
+	cmd, _ := input["command"].(string)
+	if cmd == "" {
+		return ""
+	}
+	lower := strings.ToLower(cmd)
+
+	// Deny execution of binaries from world-writable directories.
+	for _, dir := range []string{"/dev/shm", "/tmp/", "/var/tmp/"} {
+		if strings.Contains(lower, dir) && containsExecPattern(lower, dir) {
+			return "execution from " + dir + " is blocked"
+		}
+	}
+
+	// Deny common crypto-miner and reverse-shell patterns.
+	dangerousPatterns := []string{
+		"xmrig",
+		"minerd",
+		"cpuminer",
+		"cryptonight",
+		"stratum+tcp",
+		"stratum+ssl",
+		"randomx",
+		"bash -i >& /dev/tcp",
+		"nc -e /bin",
+		"ncat -e /bin",
+		"mkfifo /tmp/",
+	}
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(lower, pattern) {
+			return "blocked pattern: " + pattern
+		}
+	}
+
+	return ""
+}
+
+// containsExecPattern checks whether a command tries to execute something from
+// or write an executable into a given directory.
+func containsExecPattern(cmd, dir string) bool {
+	execIndicators := []string{
+		"chmod +x",
+		"chmod 755",
+		"chmod 777",
+		"chmod a+x",
+		"./" + dir,
+	}
+	for _, ind := range execIndicators {
+		if strings.Contains(cmd, ind) {
+			return true
+		}
+	}
+	// Direct execution: the directory path appears at the start of a word
+	// that isn't part of a read-only command (cat, ls, rm, etc.)
+	readOnlyPrefixes := []string{"cat ", "ls ", "rm ", "head ", "tail ", "file ", "stat ", "wc "}
+	for _, prefix := range readOnlyPrefixes {
+		if strings.Contains(cmd, prefix+dir) {
+			return false
+		}
+	}
+	// Check for wget/curl downloading into the directory.
+	if (strings.Contains(cmd, "curl") || strings.Contains(cmd, "wget")) && strings.Contains(cmd, dir) {
+		return true
+	}
+	return false
+}
+
+const securityLogPath = "/var/log/multica-security.log"
+
+// logSecurityEvent appends a structured line to the dedicated security log
+// file so operators can audit denied tool invocations independently from
+// the main daemon log.
+func logSecurityEvent(logger *slog.Logger, pid int, cwd, reason string) {
+	entry := fmt.Sprintf("%s  DENIED  pid=%d  cwd=%s  reason=%q\n",
+		time.Now().UTC().Format(time.RFC3339), pid, cwd, reason)
+
+	f, err := os.OpenFile(securityLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		logger.Warn("claude: failed to write security log", "error", err)
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(entry)
+	logger.Warn("claude: agent killed for dangerous tool use", "pid", pid, "reason", reason)
 }
 
 // ── Claude SDK JSON types ──
@@ -467,7 +579,7 @@ var claudeBlockedArgs = map[string]blockedArgMode{
 	"-p":                blockedStandalone, // non-interactive mode
 	"--output-format":   blockedWithValue,  // stream-json protocol
 	"--input-format":    blockedWithValue,  // stream-json protocol
-	"--permission-mode": blockedWithValue,  // bypassPermissions for autonomous operation
+	"--permission-mode": blockedWithValue,  // bypassPermissions with tool-use watchdog
 	"--mcp-config":      blockedWithValue,  // set by daemon from agent.mcp_config
 	// `--effort` is owned by the per-agent thinking_level picker so a
 	// user-supplied custom_arg cannot silently outvote it. The daemon
