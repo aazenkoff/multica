@@ -1,1 +1,1 @@
-export const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
+export const MAX_FILE_SIZE = 1024 * 1024 * 1024; // 1 GB (raised from 100 MB, matches server maxUploadSize)

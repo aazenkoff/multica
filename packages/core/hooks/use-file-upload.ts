@@ -116,7 +116,7 @@ export function useFileUpload(
   const upload = useCallback(
     async (file: File, ctx?: UploadContext): Promise<UploadResult | null> => {
       if (file.size > MAX_FILE_SIZE) {
-        throw new Error("File exceeds 100 MB limit");
+        throw new Error("File exceeds 1 GB limit");
       }
 
       setInFlight((n) => n + 1);

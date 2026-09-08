@@ -33,7 +33,11 @@ var extContentTypes = map[string]string{
 	".wasm": "application/wasm",
 }
 
-const maxUploadSize = 100 << 20 // 100 MB
+const maxUploadSize = 1 << 30 // 1 GB (raised from 100 MB; MaxBytesReader enforces it)
+
+// maxUploadMemory bounds how much of a multipart body stays in RAM before
+// spilling to disk; keep it small so a 1 GB upload does not pin 1 GB.
+const maxUploadMemory = 32 << 20
 
 const defaultAttachmentDownloadURLTTL = 30 * time.Minute
 
@@ -389,7 +393,7 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 
-	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
+	if err := r.ParseMultipartForm(maxUploadMemory); err != nil {
 		writeError(w, http.StatusBadRequest, "file too large or invalid multipart form")
 		return
 	}
